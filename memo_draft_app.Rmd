@@ -1,0 +1,161 @@
+
+```{r}
+# Load necessary libraries
+library(readr)
+library(dplyr)
+library(openai)
+library(DBI)
+library(odbc)
+library(scales)
+library(officer)
+library(magrittr)
+library(plumber)
+
+# Function to add CORS headers to responses
+add_cors <- function(res) {
+  res$setHeader("Access-Control-Allow-Origin", "*")
+  res$setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+  res$setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
+  res$setHeader("Access-Control-Expose-Headers", "Content-Disposition")
+  return(res)
+}
+
+# Load environment variables
+readRenviron("~/.Renviron")
+api_key <- Sys.getenv("OPENAI_API_KEY")
+
+# Function to generate a Word document
+generate_docx <- function(res, member = "Senator Bob", staffer = "Jasmine Williams", target_organization = "U.S. Chamber of Commerce", purpose = "To seek support for HR Bill 100") {
+  # Connect to the database
+  con <- dbConnect(
+    odbc::odbc(),
+    Driver = "/opt/homebrew/lib/libmsodbcsql.17.dylib",
+    Server = "database.legisone.ext",
+    Database = "legis",
+    UID = "jasminewilliams",
+    PWD = "rynCiWo68!",
+    Port = 1433
+  )
+
+  # Import data
+  organizations_full <- dbGetQuery(con, "SELECT * FROM dbo.organization")
+  address_a <- dbGetQuery(con, "SELECT * FROM dbo.organization_address")
+  address_b <- dbGetQuery(con, "SELECT * FROM dbo.address")
+  expenditure_a <- dbGetQuery(con, "SELECT * FROM dbo.lobby_report")
+  expenditure_b <- dbGetQuery(con, "SELECT * FROM dbo.lobby_actor")
+  issues_full <- dbGetQuery(con, "SELECT * FROM rpt.issue_lobbied_organization")
+  bills_full <- dbGetQuery(con, "SELECT * FROM rpt.bill_lobby_firms")
+  dbDisconnect(con)
+
+  # Data manipulation
+  current_year <- as.numeric(format(Sys.Date(), "%Y"))
+  start_year <- current_year - 4
+
+  suppressWarnings({
+    org_id <- organizations_full %>% filter(organization_name == target_organization) %>% select(organization_id)
+    org_name <- organizations_full %>% filter(organization_id == org_id) %>% select(organization_name)
+    org_address <- address_a %>% inner_join(address_b, by = c("address_id")) %>% filter(organization_id == org_id) %>% arrange(address_type_id) %>% slice_head(n = 1)
+    org_issues <- issues_full %>% filter(organization_id == org_id) %>% filter(between(report_year, start_year, current_year)) %>% group_by(issue_description) %>% summarize(total_count_ldas = sum(total_count_ldas), total_bills_number = sum(total_bills_number)) %>% arrange(desc(total_count_ldas)) %>% slice_head(n = 5)
+    org_spend <- expenditure_a %>% inner_join(expenditure_b, by = c("client_lobby_actor_id" = "lobby_actor_id")) %>% filter(organization_id == org_id) %>% filter(between(report_year, start_year, current_year)) %>% summarize(total = sum(expenses))
+  })
+
+  issues_str <- org_issues %>% mutate(issue_string = paste0(1:n(), ") ", issue_description, " (", total_count_ldas, " LDAs, ", total_bills_number, " Bills)")) %>% pull(issue_string) %>% paste0(collapse = "\n")
+  org_overview <- paste0("Name: ", org_name, "\nMain Office: ", org_address$address1, ", ", org_address$city, ",", org_address$us_state_id, ", ", org_address$postal_code, "\nKey Issues: \n", issues_str, "\nExpenditure (past 5 years): $", comma(org_spend$total))
+
+  suppressWarnings({
+    org_bills <- bills_full %>% filter(organization_id == org_id) %>% group_by(bill_name) %>% summarise(total_count_lda = sum(count_lda)) %>% arrange(desc(total_count_lda)) %>% slice_head(n = 5)
+  })
+
+  bills_str <- org_bills %>% mutate(bill_string = paste(row_number(), ") ", bill_name)) %>% pull(bill_string) %>% paste0(collapse = "\n")
+
+  Sys.setenv(OPENAI_API_KEY = api_key)
+
+  prompt_1 <- paste0("One paragraph overview based on the following information:", org_overview)
+  OVERVIEW <- create_completion(model = "gpt-3.5-turbo-instruct", prompt = prompt_1, max_tokens = 500)
+  overview_text <- OVERVIEW$choices[[1]]
+
+  prompt_2 <- paste0("Prepare an overview of the following bills:", bills_str)
+  RELEVANT_LEG <- create_completion(model = "gpt-3.5-turbo-instruct", prompt = prompt_2, max_tokens = 500)
+  relevant_leg_text <- RELEVANT_LEG$choices[[1]]
+
+  # Document creation
+  font_properties <- fp_text(font.size = 12, font.family = "Times New Roman")
+  heading_font_properties <- fp_text(font.size = 14, bold = TRUE, font.family = "Times New Roman")
+  doc <- read_docx()
+
+  title <- ftext("MEMORANDUM", prop = fp_text(font.size = 16, bold = TRUE, font.family = "Times New Roman"))
+  doc <- body_add_fpar(doc, fpar(title), style = "Normal")
+
+  basic_info <- paste0("To: ", member, "\nFrom: ", staffer, "\nDate: ", Sys.Date(), "\nRe: Meeting Preparation with ", target_organization)
+  basic_info_lines <- strsplit(basic_info, "\n")[[1]]
+  for (line in basic_info_lines) {
+    paragraph <- fpar(ftext(line, prop = font_properties))
+    doc <- body_add_fpar(doc, paragraph, style = "Normal")
+  }
+
+  overview_heading <- fpar(ftext("Organization Overview:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, overview_heading, style = "heading 1")
+  overview_lines <- strsplit(overview_text, "\n")[[1]]
+  for (line in overview_lines) {
+    paragraph <- fpar(ftext(line, prop = font_properties), fp_p = fp_par(text.align = "left", padding.left = 20))
+    doc <- body_add_fpar(doc, paragraph, style = "Normal")
+  }
+
+  bills_heading <- fpar(ftext("Relevant Legislation:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, bills_heading, style = "heading 1")
+  bills_lines <- strsplit(relevant_leg_text, "\n")[[1]]
+  for (line in bills_lines) {
+    paragraph <- fpar(ftext(line, prop = font_properties))
+    doc <- body_add_fpar(doc, paragraph, style = "Normal")
+  }
+
+  policy_heading <- fpar(ftext("Policy Background:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, policy_heading, style = "heading 1")
+
+  attachments_heading <- fpar(ftext("Attachments:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, attachments_heading, style = "heading 1")
+
+  personnel_heading <- fpar(ftext("Personnel Bios:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, personnel_heading, style = "heading 2")
+
+  comms_heading <- fpar(ftext("Relevant Communications:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, comms_heading, style = "heading 2")
+
+  hearing_heading <- fpar(ftext("Relevant Hearings:", prop = heading_font_properties))
+  doc <- body_add_fpar(doc, hearing_heading, style = "heading 2")
+
+  # Save the document to a temporary file
+  temp_file <- tempfile(fileext = ".docx")
+  print(doc, target = temp_file)
+  
+  # Read the content of the file
+  file_content <- readBin(temp_file, "raw", n = file.info(temp_file)$size)
+  file.remove(temp_file)
+  
+  # Set response headers
+  res$setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+  res$setHeader("Content-Disposition", 'attachment; filename="memo.docx"')
+  res$body <- file_content
+  
+  return(res)
+}
+
+# Plumber API setup
+pr <- plumber$new()
+pr$handle("GET", "/generate_docx", function(req, res, member, staffer, target_organization, purpose) {
+  res <- add_cors(res)
+  generate_docx(res, member, staffer, target_organization, purpose)
+})
+pr$handle("OPTIONS", "/*", function(req, res) {
+  res <- add_cors(res)
+  res$setHeader("Access-Control-Allow-Headers", req$HTTP_ACCESS_CONTROL_REQUEST_HEADERS)
+  res
+})
+pr$run(host = "0.0.0.0", port = 8000)
+
+# Source additional R scripts if needed
+source("api.R")
+
+```
+
+
